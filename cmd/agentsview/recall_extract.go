@@ -8,6 +8,7 @@ import (
 	"encoding/json/v2"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -103,6 +104,9 @@ func resolveExtractDistillation(
 			Model:      cfg.Model,
 			HTTPClient: httpClient,
 			Request:    request,
+			Warnf: func(format string, args ...any) {
+				log.Printf("warning: "+format, args...)
+			},
 		},
 		Prompts:   extract.PromptsFor(profile, overrides),
 		Segmenter: extract.TurnsV1{MaxWindowChars: cfg.MaxWindowChars},

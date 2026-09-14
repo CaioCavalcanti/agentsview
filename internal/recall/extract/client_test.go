@@ -1370,3 +1370,172 @@ func TestClientTransportErrorRedactsEndpoint(t *testing.T) {
 		}
 	}
 }
+
+// TestClientDistillStripsLeadingCodeFence covers gateways that answer a
+// json_schema response_format with a markdown-fenced payload plus prose:
+// the fence and the prose are transport wrapper, and the wrapped payload
+// must parse strictly exactly as an unfenced one would. The deviation is
+// non-fatal but must stay visible through Warnf.
+func TestClientDistillStripsLeadingCodeFence(t *testing.T) {
+	var requests []map[string]any
+	server := newScriptedServer(t, []scriptedResponse{{
+		finishReason: "stop",
+		content: "Here is the readout:\n```json\n" + entriesJSON(t, "fenced") +
+			"\n```\nLet me know if you need anything else.",
+	}}, &requests)
+	defer server.Close()
+
+	var warns atomic.Int64
+	client := testClient(server.URL)
+	client.Warnf = func(string, ...any) { warns.Add(1) }
+	entries, _, err := client.DistillWithRecovery(
+		context.Background(), "p", "text", 3,
+	)
+	if err != nil || len(entries) != 1 || entries[0].Title != "fenced" {
+		t.Fatalf("entries=%v err=%v", entries, err)
+	}
+	if warns.Load() != 1 {
+		t.Fatalf("warns = %d, want 1 (the fence-strip path must warn)",
+			warns.Load())
+	}
+	if len(requests) != 1 {
+		t.Fatalf("requests = %d, want 1 (a fenced success must not retry)",
+			len(requests))
+	}
+}
+
+// TestClientDistillStripsBareCodeFence pins the untagged fence form
+// (``` without a language tag): gateways differ in whether they tag the
+// block, and the tag is wrapper detail either way.
+func TestClientDistillStripsBareCodeFence(t *testing.T) {
+	var requests []map[string]any
+	server := newScriptedServer(t, []scriptedResponse{{
+		finishReason: "stop",
+		content:      "```\n" + entriesJSON(t, "bare") + "\n```",
+	}}, &requests)
+	defer server.Close()
+
+	var warns atomic.Int64
+	client := testClient(server.URL)
+	client.Warnf = func(string, ...any) { warns.Add(1) }
+	entries, _, err := client.DistillWithRecovery(
+		context.Background(), "p", "text", 3,
+	)
+	if err != nil || len(entries) != 1 || entries[0].Title != "bare" {
+		t.Fatalf("entries=%v err=%v", entries, err)
+	}
+	if warns.Load() != 1 {
+		t.Fatalf("warns = %d, want 1", warns.Load())
+	}
+}
+
+// TestClientDistillRefusesUnclosedFence pins the fail-closed rule for a
+// fence that never closes: a truncated payload must surface as a
+// protocol violation, never as salvaged partial entries, and being
+// deterministic for the same endpoint it must not retry.
+func TestClientDistillRefusesUnclosedFence(t *testing.T) {
+	var requests []map[string]any
+	server := newScriptedServer(t, []scriptedResponse{{
+		finishReason: "stop",
+		content:      "```json\n" + `{"entries":[{"type":"fact","title":"t","body":"b","entities":[]}]}`,
+	}}, &requests)
+	defer server.Close()
+
+	client := testClient(server.URL)
+	_, _, err := client.DistillWithRecovery(
+		context.Background(), "p", "text", 3,
+	)
+	if err == nil {
+		t.Fatal("an unclosed fence must be an error")
+	}
+	if !errors.Is(err, errProtocolViolation) {
+		t.Fatalf("err = %v, want a protocol violation", err)
+	}
+	if len(requests) != 1 {
+		t.Fatalf("requests = %d, want 1 (protocol violations do not retry)",
+			len(requests))
+	}
+}
+
+// TestClientDistillRefusesNonJSONInsideFence pins that stripping the
+// wrapper changes nothing about validation: content inside the fence that
+// is not schema-valid JSON fails exactly like unfenced content would.
+func TestClientDistillRefusesNonJSONInsideFence(t *testing.T) {
+	cases := map[string]string{
+		"prose payload":  "```json\nno json here\n```",
+		"empty payload":  "```json\n```\n",
+		"partial object": "```json\n{\"entries\":[\n```",
+	}
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			var requests []map[string]any
+			server := newScriptedServer(t, []scriptedResponse{{
+				finishReason: "stop",
+				content:      content,
+			}}, &requests)
+			defer server.Close()
+
+			_, _, err := testClient(server.URL).DistillWithRecovery(
+				context.Background(), "p", "text", 3,
+			)
+			if err == nil {
+				t.Fatal("non-JSON inside a fence must be an error")
+			}
+			if !errors.Is(err, errProtocolViolation) {
+				t.Fatalf("err = %v, want a protocol violation", err)
+			}
+			if len(requests) != 1 {
+				t.Fatalf("requests = %d, want 1", len(requests))
+			}
+		})
+	}
+}
+
+// TestClientDistillKeepsStrictPathWithoutFence pins the invariant that
+// matters most: without a leading fence the client behaves exactly as
+// before — valid JSON parses, prose-only fails, and the warn hook never
+// fires because no normalization happened.
+func TestClientDistillKeepsStrictPathWithoutFence(t *testing.T) {
+	t.Run("valid json stays strict and silent", func(t *testing.T) {
+		var requests []map[string]any
+		server := newScriptedServer(t, []scriptedResponse{{
+			finishReason: "stop",
+			content:      entriesJSON(t, "plain"),
+		}}, &requests)
+		defer server.Close()
+
+		var warns atomic.Int64
+		client := testClient(server.URL)
+		client.Warnf = func(string, ...any) { warns.Add(1) }
+		entries, _, err := client.DistillWithRecovery(
+			context.Background(), "p", "text", 3,
+		)
+		if err != nil || len(entries) != 1 || entries[0].Title != "plain" {
+			t.Fatalf("entries=%v err=%v", entries, err)
+		}
+		if warns.Load() != 0 {
+			t.Fatalf("warns = %d, want 0 (no fence, no warn)", warns.Load())
+		}
+	})
+	t.Run("prose-only still violates the protocol", func(t *testing.T) {
+		var requests []map[string]any
+		server := newScriptedServer(t, []scriptedResponse{{
+			finishReason: "stop",
+			content:      "The session looks clean, nothing to report.",
+		}}, &requests)
+		defer server.Close()
+
+		var warns atomic.Int64
+		client := testClient(server.URL)
+		client.Warnf = func(string, ...any) { warns.Add(1) }
+		_, _, err := client.DistillWithRecovery(
+			context.Background(), "p", "text", 3,
+		)
+		if err == nil || !errors.Is(err, errProtocolViolation) {
+			t.Fatalf("err = %v, want a protocol violation", err)
+		}
+		if warns.Load() != 0 {
+			t.Fatalf("warns = %d, want 0 (no fence, no warn)", warns.Load())
+		}
+	})
+}

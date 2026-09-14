@@ -256,6 +256,8 @@ type Client struct {
 	RetryBackoff time.Duration
 	HTTPClient   *http.Client
 	Request      RequestShape
+	// Warnf receives non-fatal diagnostics; nil is valid and silent.
+	Warnf func(format string, args ...any)
 }
 
 func (c *Client) httpClient() *http.Client {
@@ -588,7 +590,15 @@ func (c *Client) distill(
 				"request shape",
 		)
 	}
-	entries, err := parseEntries(choice.Message.Content)
+	text, fenced, stripErr := stripResponseFence(choice.Message.Content)
+	if stripErr != nil {
+		return nil, parsed.Usage, c.fenceViolation(stripErr)
+	}
+	if fenced && c.Warnf != nil {
+		c.Warnf("distill response carried a markdown code fence; " +
+			"stripped it and parsed the payload strictly")
+	}
+	entries, err := parseEntries(text)
 	if err != nil {
 		if errors.Is(err, errClientOnlyResponseLimit) {
 			return nil, parsed.Usage, err
@@ -844,6 +854,66 @@ func parseEntries(content string) ([]Entry, error) {
 		entries = append(entries, entry)
 	}
 	return entries, nil
+}
+
+// stripResponseFence tolerates OpenAI-compatible gateways that ignore
+// response_format's json_schema enforcement and wrap the payload in a
+// markdown code fence, optionally with prose around it. Only the first
+// fenced block is normalized: it is extracted verbatim and everything
+// else is treated as prose. The fired result reports whether a fence was
+// stripped so callers can log the deviation. Failures are fatal to the
+// response: a fence that never closes means the payload may be
+// truncated, and no partial or salvaged content is ever returned.
+func stripResponseFence(content string) (string, bool, error) {
+	trimmed := strings.TrimSpace(content)
+	start := strings.Index(trimmed, "```")
+	if start < 0 {
+		// No fence at all: return the content untouched so the strict
+		// path keeps byte-identical behavior (prose-only fails closed at
+		// the strict parse).
+		return content, false, nil
+	}
+	body := trimmed[start+len("```"):]
+	newline := strings.IndexByte(body, '\n')
+	if newline < 0 {
+		// The opening fence line never ends, so no block can be
+		// delimited.
+		return "", true, fmt.Errorf("fenced response has no closing fence")
+	}
+	// The rest of the opening line is the fence's language tag (```json
+	// and friends); it is dropped with the line.
+	opened := body[newline+1:]
+	closing := strings.Index(opened, "```")
+	if closing < 0 {
+		return "", true, fmt.Errorf("fenced response has no closing fence")
+	}
+	payload := strings.TrimSpace(opened[:closing])
+	if payload == "" {
+		return "", true, fmt.Errorf(
+			"fenced response carries no JSON payload",
+		)
+	}
+	return payload, true, nil
+}
+
+// fenceViolation classifies a fence-strip failure like every other
+// constrained-decoding breach: the endpoint answered 200 outside the
+// contract it was asked to enforce, so it fails without retrying.
+func (c *Client) fenceViolation(err error) error {
+	if c.credentialedEndpoint() {
+		// The failing content is endpoint-supplied; its detail can
+		// reflect the credential.
+		return fmt.Errorf(
+			"%w: distilled content violates the response schema "+
+				"(does the server enforce json_schema?); detail %s",
+			errProtocolViolation, detailWithheld,
+		)
+	}
+	return fmt.Errorf(
+		"%w: distilled content violates the response schema (does "+
+			"the server enforce json_schema?): %w",
+		errProtocolViolation, err,
+	)
 }
 
 // strictObject unmarshals data as a JSON object holding exactly the given
