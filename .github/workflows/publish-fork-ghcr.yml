@@ -1,0 +1,76 @@
+name: Publish fork image
+
+# Fork-vehicle workflow: builds the patched tree and publishes it to
+# ghcr.io under the fork owner's namespace. Upstream CI is untouched.
+
+on:
+  push:
+    branches:
+      - fenced-json-0.43.0
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-fork-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test-extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      # Mirrors upstream ci.yml: the cgo sqlite tests compile against the
+      # header of the exact amalgamation go-sqlite3 bundles.
+      - name: Prepare SQLite header
+        run: |
+          go mod download github.com/mattn/go-sqlite3
+          mkdir -p .sqlite-include
+          cp "$(go list -m -f '{{.Dir}}' github.com/mattn/go-sqlite3)/sqlite3-binding.h" .sqlite-include/sqlite3.h
+          echo "CGO_CFLAGS=-O2 -g -I$GITHUB_WORKSPACE/.sqlite-include" >> "$GITHUB_ENV"
+
+      # Mirrors upstream ci.yml: the extraction package transitively compiles
+      # internal/pricing, whose fallback embed needs a generated snapshot.
+      - name: Generate pricing snapshot
+        run: go run ./internal/pricing/cmd/litellm-snapshot
+
+      - name: Test extraction client
+        run: go test ./internal/recall/extract/
+
+  publish:
+    needs: test-extract
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ghcr.io/caiocavalcanti/agentsview:0.43.0-fencedjson-1
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
